@@ -24,7 +24,10 @@ pieces:
   `response.completed` / `response.incomplete` / `response.failed` event with
   the full `output` and `usage`). It binds to `127.0.0.1` and requires a
   random per-launch bearer token, so only the runner spawned by the adapter
-  can use it.
+  can use it. Reasoning that chat backends stream as plain content (classic
+  "think" tags or a leading `Thinking: ...` label) is moved out of the answer:
+  think-tag bodies join the reasoning summary, the label is stripped, real
+  plan text stays.
 - `src/adapter.js` - the ACP agent. It implements `initialize`, `session/new`,
   `session/load`, `session/prompt`, `session/cancel` and
   `session/set_config_option` over newline-delimited JSON-RPC and drives one

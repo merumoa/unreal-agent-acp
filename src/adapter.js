@@ -35,7 +35,7 @@ const PROTOCOL_VERSION = 1;
 const AGENT_INFO = {
   name: "unreal-agent-acp",
   title: "Unreal Agent (ACP bridge)",
-  version: "0.4.1",
+  version: "0.4.2",
 };
 
 // Models offered in the client's model selector. Override with UA_MODELS
