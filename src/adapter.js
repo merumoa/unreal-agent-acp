@@ -35,7 +35,7 @@ const PROTOCOL_VERSION = 1;
 const AGENT_INFO = {
   name: "unreal-agent-acp",
   title: "Unreal Agent (ACP bridge)",
-  version: "0.1.0",
+  version: "0.2.0",
 };
 
 const DEFAULT_MODELS = [
@@ -200,6 +200,82 @@ function stopFromResponse(stop) {
 
 // ---------- prompt execution ----------
 
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+// The runner is a batch process: model output for a turn is only available
+// once the whole LLM response is persisted. To still render like a streaming
+// agent (pi/DSH show thinking token by token), text is replayed in small
+// chunks within a pacing budget, so Zed shows a live Thinking block with a
+// plausible duration instead of an instant zero-length block.
+const PACING_BUDGET_MS = 2000;
+const PACING_CHUNK_CHARS = 24;
+
+async function pacedEmit(rpc, session, updateType, text, meta) {
+  if (!text) return;
+  const update = { sessionUpdate: updateType, content: { type: "text", text: "" } };
+  if (text.length <= PACING_CHUNK_CHARS * 2) {
+    update.content.text = text;
+    if (meta) update._meta = { unreal: meta };
+    rpc.notify("session/update", { sessionId: session.id, update });
+    return;
+  }
+  const pieces = [];
+  for (let i = 0; i < text.length; i += PACING_CHUNK_CHARS) {
+    pieces.push(text.slice(i, i + PACING_CHUNK_CHARS));
+  }
+  const delay = Math.max(4, Math.min(40, Math.floor(PACING_BUDGET_MS / pieces.length)));
+  for (let i = 0; i < pieces.length; i++) {
+    if (session.cancelled) return;
+    update.content.text = pieces[i];
+    if (meta && i === pieces.length - 1) update._meta = { unreal: meta };
+    rpc.notify("session/update", { sessionId: session.id, update });
+    await sleep(delay);
+  }
+}
+
+const MAX_TOOL_OUTPUT_CHARS = 4000;
+
+// Extracts human-readable output from the operations recorded with a
+// tool_call_status item. Operation JSON (PascalCase) is
+// {ID, Type: "shell", Status, State: ShellState}; ShellState carries either
+// Result {Out, Err, ExitCode} for a finished command or InlineOut/InlineErr
+// (base64) plus TerminalError and OutPath for large outputs.
+function operationsOutput(operations) {
+  if (!Array.isArray(operations)) return "";
+  const parts = [];
+  for (const op of operations) {
+    if (!op || op.Type !== "shell") continue;
+    let state = op.State;
+    if (typeof state === "string") {
+      try {
+        state = JSON.parse(state);
+      } catch {
+        continue;
+      }
+    }
+    if (!state || typeof state !== "object") continue;
+    const chunks = [];
+    if (state.Result) {
+      if (state.Result.Out) chunks.push(state.Result.Out);
+      if (state.Result.Err) chunks.push("[stderr] " + state.Result.Err);
+      if (state.Result.ExitCode) chunks.push("exit code: " + state.Result.ExitCode);
+    } else if (state.InlineOut || state.InlineErr) {
+      if (state.InlineOut) chunks.push(Buffer.from(state.InlineOut, "base64").toString("utf8"));
+      if (state.InlineErr) chunks.push("[stderr] " + Buffer.from(state.InlineErr, "base64").toString("utf8"));
+    }
+    if (state.TerminalError) chunks.push("terminal error: " + state.TerminalError);
+    if (!chunks.length && state.OutPath) chunks.push("(output written to " + state.OutPath + ")");
+    if (chunks.length) parts.push(chunks.join("\n"));
+  }
+  const text = parts.join("\n---\n").trim();
+  if (text.length > MAX_TOOL_OUTPUT_CHARS) {
+    return text.slice(0, MAX_TOOL_OUTPUT_CHARS) + "\n... (truncated, full stream in the runner session store)";
+  }
+  return text;
+}
+
 async function runPrompt(rpc, session, params, promptId) {
   const runner = findRunner();
   const request = {
@@ -219,6 +295,7 @@ async function runPrompt(rpc, session, params, promptId) {
   let lastStop = null;
   let errorMessage = null;
   session.cancelled = false;
+  const startedAt = Date.now();
 
   await new Promise((resolve) => {
     const child = spawn(
@@ -244,6 +321,8 @@ async function runPrompt(rpc, session, params, promptId) {
     child.stdin.end();
 
     const rl = readline.createInterface({ input: child.stdout, terminal: false });
+    const toolCards = new Map(); // callId -> {title, kind}
+    let queue = Promise.resolve();
     rl.on("line", (line) => {
       if (!line.trim()) return;
       let item;
@@ -252,6 +331,11 @@ async function runPrompt(rpc, session, params, promptId) {
       } catch {
         return;
       }
+      queue = queue.then(() => handleItem(item)).catch((err) => log("item handling error:", err.message));
+    });
+
+    async function handleItem(item) {
+      if (session.cancelled) return;
       // Runner session items: {"Sequence":n,"RecordedAt":...,"Kind":"...","Data":{...}}
       // (field names PascalCase; kind values lowercase). Errors arrive as
       // {"Type":"error","Message":"..."}.
@@ -259,65 +343,77 @@ async function runPrompt(rpc, session, params, promptId) {
         errorMessage = item.Message;
         return;
       }
-      if (item.Kind !== "model_response" && item.Kind !== "tool_call_status") return;
-
       if (item.Kind === "model_response") {
         const response = item.Data?.Response || {};
         lastStop = response.Stop || lastStop;
         const turnUsage = mapUsage(response.Usage);
         addUsage(totals, turnUsage);
         for (const output of response.Output || []) {
-          if (output.Type === "message") {
-            rpc.notify("session/update", {
-              sessionId: session.id,
-              update: {
-                sessionUpdate: "agent_message_chunk",
-                content: { type: "text", text: output.Data?.Text ?? "" },
-                _meta: { unreal: { model: session.model, turn: item.Data?.TurnID, usage: turnUsage } },
-              },
+          if (output.Type === "reasoning") {
+            const summary = (output.Data?.Summary || []).join("\n");
+            if (summary) {
+              await pacedEmit(rpc, session, "agent_thought_chunk", summary, null);
+            }
+          } else if (output.Type === "message") {
+            await pacedEmit(rpc, session, "agent_message_chunk", output.Data?.Text ?? "", {
+              model: session.model,
+              turn: item.Data?.TurnID,
+              usage: turnUsage,
             });
           } else if (output.Type === "tool_call") {
             const call = output.Data || {};
+            const callId = call.CallID || call.Name;
+            const card = { title: toolTitle(call.Name, call.Arguments), kind: toolKind(call.Name) };
+            toolCards.set(callId, card);
             rpc.notify("session/update", {
               sessionId: session.id,
               update: {
                 sessionUpdate: "tool_call",
-                toolCallId: call.CallID || call.Name,
-                title: toolTitle(call.Name, call.Arguments),
-                kind: toolKind(call.Name),
+                toolCallId: callId,
+                title: card.title,
+                kind: card.kind,
                 status: "pending",
                 rawInput: call.Arguments || "{}",
               },
             });
-          } else if (output.Type === "reasoning") {
-            const summary = (output.Data?.Summary || []).join("\n");
-            if (summary) {
-              rpc.notify("session/update", {
-                sessionId: session.id,
-                update: {
-                  sessionUpdate: "agent_thought_chunk",
-                  content: { type: "text", text: summary },
-                },
-              });
-            }
           }
         }
         return;
       }
 
-      // tool_call_status Data: {TurnID, CallID, Status: {Error?, WaitingFor?}, Operations?}
+      if (item.Kind !== "tool_call_status") return;
+      // tool_call_status Data: {TurnID, CallID, Status: {Error?, WaitingFor?}, Operations?}.
+      // WaitingFor stays non-empty for the whole call lifecycle; the terminal
+      // state is signalled by Operations[].Status (ready -> completed/failed).
       const status = item.Data?.Status || {};
-      const acpStatus = status.Error ? "failed" : (status.WaitingFor?.length ? "in_progress" : "completed");
+      const callId = item.Data?.CallID;
+      const card = toolCards.get(callId) || { title: "", kind: "other" };
+      const ops = Array.isArray(item.Data?.Operations) ? item.Data.Operations : [];
+      const opStatuses = ops.map((op) => op && op.Status).filter(Boolean);
+      const terminal = opStatuses.length > 0 && opStatuses.every((s) => ["completed", "failed", "canceled"].includes(s));
+      let acpStatus;
+      if (status.Error) {
+        acpStatus = "failed";
+      } else if (terminal) {
+        acpStatus = opStatuses.some((s) => s === "failed" || s === "canceled") ? "failed" : "completed";
+      } else {
+        acpStatus = "in_progress";
+      }
       const update = {
         sessionUpdate: "tool_call_update",
-        toolCallId: item.Data?.CallID,
+        toolCallId: callId,
+        title: card.title,
+        kind: card.kind,
         status: acpStatus,
       };
-      if (status.Error) {
+      if (acpStatus === "failed" && status.Error) {
         update.content = [{ type: "content", content: { type: "text", text: "error: " + status.Error } }];
+      } else if (acpStatus === "completed") {
+        const outputText = operationsOutput(item.Data?.Operations);
+        if (outputText) update.content = [{ type: "content", content: { type: "text", text: outputText } }];
       }
       rpc.notify("session/update", { sessionId: session.id, update });
-    });
+    }
 
     let stderrTail = "";
     child.stderr.setEncoding("utf8");
@@ -327,20 +423,21 @@ async function runPrompt(rpc, session, params, promptId) {
 
     child.on("error", (err) => {
       errorMessage = "failed to start runner: " + err.message;
-      resolve();
+      queue.then(resolve);
     });
     child.on("close", (code) => {
       log("runner exited code=" + code, "session=" + session.id);
       if (code !== 0 && !session.cancelled && !errorMessage) {
         errorMessage = (stderrTail.split("\n").filter(Boolean).pop() || "runner exited with code " + code).trim();
       }
-      resolve();
+      // let the pacing queue flush remaining updates before the prompt result
+      queue.then(resolve);
     });
   });
 
   if (session.cancelled) {
     return {
-      _meta: { unreal: { stop: "cancelled", usage: totals } },
+      _meta: { unreal: { stop: "cancelled", usage: totals, duration_ms: Date.now() - startedAt } },
       stopReason: "cancelled",
     };
   }
@@ -352,7 +449,7 @@ async function runPrompt(rpc, session, params, promptId) {
     log("runner error: " + errorMessage);
   }
   return {
-    _meta: { unreal: { stop: lastStop || "complete", usage: totals } },
+    _meta: { unreal: { stop: lastStop || "complete", usage: totals, duration_ms: Date.now() - startedAt } },
     stopReason: lastStop ? stopFromResponse(lastStop) : "end_turn",
   };
 }

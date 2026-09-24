@@ -34,6 +34,21 @@ Sessions are durable: the ACP session id is reused as the runner's persisted
 session id, so consecutive prompts in the same session continue the same
 history (`~/.local/state/unreal-agent/sessions`).
 
+### Display in the client
+
+The runner is a batch process: a turn's model output is only available when
+the whole LLM response is persisted, so the adapter replays it in a
+client-friendly way:
+
+- reasoning summaries are emitted as paced `agent_thought_chunk` notifications
+  (small chunks within a ~2s budget), giving a live-looking Thinking block;
+- the assistant answer is emitted as paced `agent_message_chunk` text;
+- bash tool cards keep their command as the title across updates and get the
+  command output (stdout/stderr/exit code, extracted from the runner's shell
+  operation state) attached to the completed `tool_call_update`;
+- per-LLM-turn token usage rides in `_meta.unreal.usage` of the message
+  chunk, task totals in `_meta.unreal.usage` of the prompt result.
+
 ## Requirements
 
 - Node.js >= 20 (no npm dependencies)
@@ -117,6 +132,9 @@ verifies the tee log when `UA_TEE` points to `acp-tee.js`.
 - `session/load` is not implemented (fresh history per Zed session window).
 - The chat backend's reasoning stream (e.g. `reasoning_content`) is surfaced
   as a reasoning summary item, not replayed as provider-native reasoning.
+- Thinking/answer "streaming" is replay pacing over batch turn output (the
+  runner has no partial-message streaming; `include_partial_messages` is
+  accepted but ignored upstream).
 
 ## License
 

@@ -41,7 +41,7 @@ const child = spawn(command, args, { env: process.env, stdio: ["pipe", "pipe", "
 child.stderr.setEncoding("utf8");
 child.stderr.on("data", (chunk) => process.stderr.write("[adapter] " + chunk));
 
-const seen = { toolCall: false, toolCallUpdate: false, messageChunk: false, usage: false };
+const seen = { toolCall: false, toolCallUpdate: false, messageChunk: false, usage: false, completedOutput: false };
 let updateCount = 0;
 let currentSession = null;
 let nextId = 1;
@@ -144,6 +144,7 @@ rl.on("line", (line) => {
       if (!seen.usage) fail("no usage meta observed");
       if (!seen.messageChunk) fail("no agent_message_chunk observed");
       if (!seen.toolCall || !seen.toolCallUpdate) fail("tool call flow not observed");
+      if (!seen.completedOutput) fail("no completed tool_call_update with output content");
       finish();
     }
     return;
@@ -163,6 +164,9 @@ rl.on("line", (line) => {
       seen.toolCallUpdate = true;
       if (update.status === "failed" && update.content) {
         fail("tool call failed: " + JSON.stringify(update.content));
+      }
+      if (update.status === "completed" && Array.isArray(update.content) && update.content.length) {
+        seen.completedOutput = true;
       }
     }
   }
