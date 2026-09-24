@@ -35,7 +35,7 @@ const PROTOCOL_VERSION = 1;
 const AGENT_INFO = {
   name: "unreal-agent-acp",
   title: "Unreal Agent (ACP bridge)",
-  version: "0.2.0",
+  version: "0.3.0",
 };
 
 const DEFAULT_MODELS = [
@@ -212,12 +212,13 @@ function sleep(ms) {
 const PACING_BUDGET_MS = 2000;
 const PACING_CHUNK_CHARS = 24;
 
+// meta is the complete _meta object (or null) attached to the final chunk.
 async function pacedEmit(rpc, session, updateType, text, meta) {
   if (!text) return;
   const update = { sessionUpdate: updateType, content: { type: "text", text: "" } };
   if (text.length <= PACING_CHUNK_CHARS * 2) {
     update.content.text = text;
-    if (meta) update._meta = { unreal: meta };
+    if (meta) update._meta = meta;
     rpc.notify("session/update", { sessionId: session.id, update });
     return;
   }
@@ -229,7 +230,7 @@ async function pacedEmit(rpc, session, updateType, text, meta) {
   for (let i = 0; i < pieces.length; i++) {
     if (session.cancelled) return;
     update.content.text = pieces[i];
-    if (meta && i === pieces.length - 1) update._meta = { unreal: meta };
+    if (meta && i === pieces.length - 1) update._meta = meta;
     rpc.notify("session/update", { sessionId: session.id, update });
     await sleep(delay);
   }
@@ -274,6 +275,114 @@ function operationsOutput(operations) {
     return text.slice(0, MAX_TOOL_OUTPUT_CHARS) + "\n... (truncated, full stream in the runner session store)";
   }
   return text;
+}
+
+// Maps one runner session item to a list of ACP session/update payloads.
+// Shared by the live runner stream (with pacing + usage meta) and by
+// session/load history replay (plain, no meta). metaModel: session model name
+// for usage meta, or falsy for replay.
+function itemToUpdates(item, toolCards, metaModel) {
+  if (item.Kind === "model_response") {
+    const response = item.Data?.Response || {};
+    const usage = metaModel ? mapUsage(response.Usage) : null;
+    const updates = [];
+    for (const output of response.Output || []) {
+      if (output.Type === "reasoning") {
+        const summary = (output.Data?.Summary || []).join("\n");
+        if (summary) {
+          updates.push({ sessionUpdate: "agent_thought_chunk", content: { type: "text", text: summary } });
+        }
+      } else if (output.Type === "message") {
+        const update = {
+          sessionUpdate: "agent_message_chunk",
+          content: { type: "text", text: output.Data?.Text ?? "" },
+        };
+        if (usage) update._meta = { unreal: { model: metaModel, turn: item.Data?.TurnID, usage } };
+        updates.push(update);
+      } else if (output.Type === "tool_call") {
+        const call = output.Data || {};
+        const callId = call.CallID || call.Name;
+        const card = { title: toolTitle(call.Name, call.Arguments), kind: toolKind(call.Name) };
+        toolCards.set(callId, card);
+        updates.push({
+          sessionUpdate: "tool_call",
+          toolCallId: callId,
+          title: card.title,
+          kind: card.kind,
+          status: "pending",
+          rawInput: call.Arguments || "{}",
+        });
+      }
+    }
+    return updates;
+  }
+
+  if (item.Kind !== "tool_call_status") return [];
+  // tool_call_status Data: {TurnID, CallID, Status: {Error?, WaitingFor?}, Operations?}.
+  // WaitingFor stays non-empty for the whole call lifecycle; the terminal
+  // state is signalled by Operations[].Status (ready -> completed/failed).
+  const status = item.Data?.Status || {};
+  const callId = item.Data?.CallID;
+  const card = toolCards.get(callId) || { title: "", kind: "other" };
+  const ops = Array.isArray(item.Data?.Operations) ? item.Data.Operations : [];
+  const opStatuses = ops.map((op) => op && op.Status).filter(Boolean);
+  const terminal = opStatuses.length > 0 && opStatuses.every((s) => ["completed", "failed", "canceled"].includes(s));
+  let acpStatus;
+  if (status.Error) {
+    acpStatus = "failed";
+  } else if (terminal) {
+    acpStatus = opStatuses.some((s) => s === "failed" || s === "canceled") ? "failed" : "completed";
+  } else {
+    acpStatus = "in_progress";
+  }
+  const update = {
+    sessionUpdate: "tool_call_update",
+    toolCallId: callId,
+    title: card.title,
+    kind: card.kind,
+    status: acpStatus,
+  };
+  if (acpStatus === "failed" && status.Error) {
+    update.content = [{ type: "content", content: { type: "text", text: "error: " + status.Error } }];
+  } else if (acpStatus === "completed") {
+    const outputText = operationsOutput(item.Data?.Operations);
+    if (outputText) update.content = [{ type: "content", content: { type: "text", text: outputText } }];
+  }
+  return [update];
+}
+
+// Reads the runner's persisted session store and replays the conversation as
+// ACP updates for session/load (user prompts, thinking, answers, tool cards).
+function historyUpdates(sessionId, toolCards) {
+  const file = path.join(SESSION_DIRECTORY, sessionId + ".session.jsonl");
+  const updates = [];
+  let raw;
+  try {
+    raw = fs.readFileSync(file, "utf8");
+  } catch {
+    return updates; // no persisted store: resume with an empty thread
+  }
+  for (const line of raw.split("\n")) {
+    if (!line.trim()) continue;
+    let record;
+    try {
+      record = JSON.parse(line);
+    } catch {
+      continue;
+    }
+    if (record.type !== "item") continue;
+    const item = record.data?.Item;
+    if (!item) continue;
+    if (item.Kind === "input" && item.Data?.Kind === "external" && typeof item.Data?.Payload === "string") {
+      updates.push({
+        sessionUpdate: "user_message_chunk",
+        content: { type: "text", text: item.Data.Payload },
+      });
+      continue;
+    }
+    updates.push(...itemToUpdates(item, toolCards, false));
+  }
+  return updates;
 }
 
 async function runPrompt(rpc, session, params, promptId) {
@@ -346,73 +455,18 @@ async function runPrompt(rpc, session, params, promptId) {
       if (item.Kind === "model_response") {
         const response = item.Data?.Response || {};
         lastStop = response.Stop || lastStop;
-        const turnUsage = mapUsage(response.Usage);
-        addUsage(totals, turnUsage);
-        for (const output of response.Output || []) {
-          if (output.Type === "reasoning") {
-            const summary = (output.Data?.Summary || []).join("\n");
-            if (summary) {
-              await pacedEmit(rpc, session, "agent_thought_chunk", summary, null);
-            }
-          } else if (output.Type === "message") {
-            await pacedEmit(rpc, session, "agent_message_chunk", output.Data?.Text ?? "", {
-              model: session.model,
-              turn: item.Data?.TurnID,
-              usage: turnUsage,
-            });
-          } else if (output.Type === "tool_call") {
-            const call = output.Data || {};
-            const callId = call.CallID || call.Name;
-            const card = { title: toolTitle(call.Name, call.Arguments), kind: toolKind(call.Name) };
-            toolCards.set(callId, card);
-            rpc.notify("session/update", {
-              sessionId: session.id,
-              update: {
-                sessionUpdate: "tool_call",
-                toolCallId: callId,
-                title: card.title,
-                kind: card.kind,
-                status: "pending",
-                rawInput: call.Arguments || "{}",
-              },
-            });
-          }
+        addUsage(totals, mapUsage(response.Usage));
+      }
+      for (const update of itemToUpdates(item, toolCards, item.Kind === "model_response" ? session.model : null)) {
+        if (
+          (update.sessionUpdate === "agent_thought_chunk" || update.sessionUpdate === "agent_message_chunk") &&
+          update.content?.text
+        ) {
+          await pacedEmit(rpc, session, update.sessionUpdate, update.content.text, update._meta);
+        } else {
+          rpc.notify("session/update", { sessionId: session.id, update });
         }
-        return;
       }
-
-      if (item.Kind !== "tool_call_status") return;
-      // tool_call_status Data: {TurnID, CallID, Status: {Error?, WaitingFor?}, Operations?}.
-      // WaitingFor stays non-empty for the whole call lifecycle; the terminal
-      // state is signalled by Operations[].Status (ready -> completed/failed).
-      const status = item.Data?.Status || {};
-      const callId = item.Data?.CallID;
-      const card = toolCards.get(callId) || { title: "", kind: "other" };
-      const ops = Array.isArray(item.Data?.Operations) ? item.Data.Operations : [];
-      const opStatuses = ops.map((op) => op && op.Status).filter(Boolean);
-      const terminal = opStatuses.length > 0 && opStatuses.every((s) => ["completed", "failed", "canceled"].includes(s));
-      let acpStatus;
-      if (status.Error) {
-        acpStatus = "failed";
-      } else if (terminal) {
-        acpStatus = opStatuses.some((s) => s === "failed" || s === "canceled") ? "failed" : "completed";
-      } else {
-        acpStatus = "in_progress";
-      }
-      const update = {
-        sessionUpdate: "tool_call_update",
-        toolCallId: callId,
-        title: card.title,
-        kind: card.kind,
-        status: acpStatus,
-      };
-      if (acpStatus === "failed" && status.Error) {
-        update.content = [{ type: "content", content: { type: "text", text: "error: " + status.Error } }];
-      } else if (acpStatus === "completed") {
-        const outputText = operationsOutput(item.Data?.Operations);
-        if (outputText) update.content = [{ type: "content", content: { type: "text", text: outputText } }];
-      }
-      rpc.notify("session/update", { sessionId: session.id, update });
     }
 
     let stderrTail = "";
@@ -469,47 +523,53 @@ async function main() {
     agentInfo: AGENT_INFO,
     authMethods: [],
     agentCapabilities: {
-      loadSession: false,
+      loadSession: true,
       promptCapabilities: { image: false, audio: false, embeddedContext: false },
     },
   }));
 
   rpc.on("initialized", () => {});
 
-  rpc.on("session/new", (params) => {
-    const id = crypto.randomUUID();
-    sessions.set(id, {
+  function newSession(id, cwd) {
+    const session = {
       id,
-      cwd: params?.cwd || process.cwd(),
+      cwd: cwd || process.cwd(),
       model: DEFAULT_MODEL,
       thinking: DEFAULT_THINKING,
       proxyPort: proxy.port,
       child: null,
       cancelled: false,
-    });
-    return {
-      sessionId: id,
-      configOptions: [
-        {
-          type: "select",
-          id: "model",
-          category: "model",
-          name: "Model",
-          description: "Model served through the responses-proxy",
-          currentValue: DEFAULT_MODEL,
-          options: DEFAULT_MODELS.map((model) => ({ value: model, name: model, description: null })),
-        },
-        {
-          type: "select",
-          id: "thinking_level",
-          category: "thought_level",
-          name: "Thinking",
-          description: "Reasoning effort passed to the runner",
-          currentValue: DEFAULT_THINKING,
-          options: THINKING_LEVELS.map((level) => ({ value: level, name: "Thinking: " + level, description: null })),
-        },
-      ],
     };
+    sessions.set(id, session);
+    return session;
+  }
+
+  function configOptionsPayload(session) {
+    return [
+      {
+        type: "select",
+        id: "model",
+        category: "model",
+        name: "Model",
+        description: "Model served through the responses-proxy",
+        currentValue: session.model,
+        options: DEFAULT_MODELS.map((model) => ({ value: model, name: model, description: null })),
+      },
+      {
+        type: "select",
+        id: "thinking_level",
+        category: "thought_level",
+        name: "Thinking",
+        description: "Reasoning effort passed to the runner",
+        currentValue: session.thinking,
+        options: THINKING_LEVELS.map((level) => ({ value: level, name: "Thinking: " + level, description: null })),
+      },
+    ];
+  }
+
+  rpc.on("session/new", (params) => {
+    const session = newSession(crypto.randomUUID(), params?.cwd);
+    return { sessionId: session.id, configOptions: configOptionsPayload(session) };
   });
 
   rpc.on("session/set_config_option", (params) => {
@@ -520,8 +580,20 @@ async function main() {
     return {};
   });
 
-  rpc.on("session/load", () => {
-    throw Object.assign(new Error("loadSession is not supported by unreal-agent-acp"), { code: -32601 });
+  rpc.on("session/load", async (params) => {
+    const id = params?.sessionId;
+    if (!id || typeof id !== "string") {
+      throw Object.assign(new Error("sessionId is required"), { code: -32602 });
+    }
+    const session = sessions.get(id) || newSession(id, params?.cwd);
+    session.proxyPort = proxy.port;
+    // Replay the persisted conversation (user prompts, thinking, answers,
+    // tool cards) so the client restores the thread before the next prompt.
+    const toolCards = new Map();
+    for (const update of historyUpdates(id, toolCards)) {
+      rpc.notify("session/update", { sessionId: id, update });
+    }
+    return { configOptions: configOptionsPayload(session) };
   });
 
   rpc.on("session/prompt", async (params, id) => {

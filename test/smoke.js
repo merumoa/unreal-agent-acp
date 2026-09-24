@@ -41,7 +41,14 @@ const child = spawn(command, args, { env: process.env, stdio: ["pipe", "pipe", "
 child.stderr.setEncoding("utf8");
 child.stderr.on("data", (chunk) => process.stderr.write("[adapter] " + chunk));
 
-const seen = { toolCall: false, toolCallUpdate: false, messageChunk: false, usage: false, completedOutput: false };
+const seen = {
+  toolCall: false,
+  toolCallUpdate: false,
+  messageChunk: false,
+  usage: false,
+  completedOutput: false,
+  replayUserChunk: false,
+};
 let updateCount = 0;
 let currentSession = null;
 let nextId = 1;
@@ -88,6 +95,7 @@ function finish() {
       seen.messageChunk +
       " usage=" +
       seen.usage +
+      " resume=ok" +
       "\n",
   );
   child.kill("SIGTERM");
@@ -145,6 +153,22 @@ rl.on("line", (line) => {
       if (!seen.messageChunk) fail("no agent_message_chunk observed");
       if (!seen.toolCall || !seen.toolCallUpdate) fail("tool call flow not observed");
       if (!seen.completedOutput) fail("no completed tool_call_update with output content");
+      request("session/load", { sessionId: currentSession, cwd: process.cwd(), mcpServers: [] }, "load");
+    } else if (handler === "load") {
+      if (!Array.isArray(message.result.configOptions) || !message.result.configOptions.length) {
+        fail("session/load returned no configOptions");
+      }
+      if (!seen.replayUserChunk) fail("session/load replayed no user_message_chunk");
+      request(
+        "session/prompt",
+        {
+          sessionId: currentSession,
+          prompt: [{ type: "text", text: "Reply with exactly: resume-ok" }],
+        },
+        "prompt2",
+      );
+    } else if (handler === "prompt2") {
+      if (message.result.stopReason !== "end_turn") fail("resume prompt ended with " + message.result.stopReason);
       finish();
     }
     return;
@@ -160,6 +184,7 @@ rl.on("line", (line) => {
       if (usage && (usage.input_tokens || 0) + (usage.output_tokens || 0) > 0) seen.usage = true;
     }
     if (update.sessionUpdate === "tool_call") seen.toolCall = true;
+    if (update.sessionUpdate === "user_message_chunk") seen.replayUserChunk = true;
     if (update.sessionUpdate === "tool_call_update") {
       seen.toolCallUpdate = true;
       if (update.status === "failed" && update.content) {
