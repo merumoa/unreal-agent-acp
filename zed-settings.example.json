@@ -1,0 +1,12 @@
+{
+  "agent_servers": {
+    "Unreal Agent": {
+      "type": "custom",
+      "command": "/bin/zsh",
+      "args": [
+        "-c",
+        "source ~/.zshrc >/dev/null 2>&1; export UA_API_KEY='<YOUR_API_KEY>'; export UA_BASE_URL='<YOUR_OPENAI_COMPATIBLE_BASE_URL>/v1'; exec node <PATH_TO>/unreal-agent-acp/src/adapter.js"
+      ]
+    }
+  }
+}
