@@ -35,7 +35,7 @@ const PROTOCOL_VERSION = 1;
 const AGENT_INFO = {
   name: "unreal-agent-acp",
   title: "Unreal Agent (ACP bridge)",
-  version: "0.4.0",
+  version: "0.4.1",
 };
 
 // Models offered in the client's model selector. Override with UA_MODELS
@@ -135,7 +135,10 @@ class Rpc {
           this.send({
             jsonrpc: "2.0",
             id,
-            error: { code: err.code && Number.isInteger(err.code) ? err.code : -32000, message: err.message },
+            // NOTE: ACP reserves -32000 for "auth required"; generic failures
+            // must surface as internal errors, otherwise clients show an
+            // authentication banner instead of the real problem.
+            error: { code: err.code && Number.isInteger(err.code) ? err.code : -32603, message: err.message },
           });
         }
       });
@@ -525,7 +528,7 @@ async function runPrompt(rpc, session, params) {
     };
   }
   if (errorMessage && lastStop === null) {
-    throw Object.assign(new Error(errorMessage), { code: -32000 });
+    throw Object.assign(new Error(errorMessage), { code: -32603 });
   }
   if (errorMessage) {
     // runner finished with an error event but had produced model output; surface it
@@ -582,6 +585,10 @@ async function main() {
   }));
 
   rpc.on("initialized", () => {});
+
+  // No authMethods are declared, so this should never be called; answered for
+  // safety so a stray authenticate request cannot fail the session.
+  rpc.on("authenticate", () => ({}));
 
   function newSession(id, cwd) {
     const session = {

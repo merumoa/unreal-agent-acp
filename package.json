@@ -1,6 +1,6 @@
 {
   "name": "unreal-agent-acp",
-  "version": "0.4.0",
+  "version": "0.4.1",
   "description": "Agent Client Protocol bridge for the unreal-agent runner, with a local OpenAI Responses API -> chat/completions proxy",
   "license": "MIT",
   "main": "src/adapter.js",
