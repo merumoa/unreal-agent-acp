@@ -84,7 +84,7 @@ adapter logs or in the ACP traffic.
 ### Logging the traffic (tee)
 
 `adapter.js` is a normal stdio ACP agent, so it can sit behind any logging
-tee. With [acp-tee.js](https://github.com/)-style proxies:
+tee. With a tee such as the one used by existing harness integrations:
 
 ```
 node acp-tee.js --log ~/.local/state/harnessmeter/unreal-acp.ndjson --tag unreal -- node .../src/adapter.js
