@@ -129,7 +129,9 @@ verifies the tee log when `UA_TEE` points to `acp-tee.js`.
 - Prompts are text-only (the runner's request schema is text-only).
 - Tool results carrying images are flattened to a text placeholder by the
   proxy; hosted tools (`web_search`) are skipped.
-- `session/load` is not implemented (fresh history per Zed session window).
+- `session/load` replays the persisted conversation from the runner's session
+  store (text, tool cards and thinking); attachments and usage from past
+  turns are not restored.
 - The chat backend's reasoning stream (e.g. `reasoning_content`) is surfaced
   as a reasoning summary item, not replayed as provider-native reasoning.
 - Thinking/answer "streaming" is replay pacing over batch turn output (the
