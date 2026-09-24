@@ -35,24 +35,26 @@ const PROTOCOL_VERSION = 1;
 const AGENT_INFO = {
   name: "unreal-agent-acp",
   title: "Unreal Agent (ACP bridge)",
-  version: "0.3.0",
+  version: "0.4.0",
 };
 
-const DEFAULT_MODELS = [
-  "glm53-flash",
-  "qwen38-flash-next",
-  "qwen38-27b",
-  "ultra-coder",
-  "qwen35-397b-a17b",
-  "qwen35-122b-a10b",
-  "qwen35-35b-a3b",
-];
+// Models offered in the client's model selector. Override with UA_MODELS
+// (comma-separated) to match your gateway's catalog.
+const DEFAULT_MODELS = (process.env.UA_MODELS || "gpt-4o-mini,gpt-4o")
+  .split(",")
+  .map((model) => model.trim())
+  .filter(Boolean);
 const THINKING_LEVELS = ["low", "medium", "high", "xhigh", "max"];
 const DEFAULT_MODEL = process.env.UA_DEFAULT_MODEL || DEFAULT_MODELS[0];
 const DEFAULT_THINKING = process.env.UA_DEFAULT_THINKING || "high";
+const MAX_ATTEMPTS = String(parseInt(process.env.UA_MAX_ATTEMPTS || "5", 10) || 5);
 const SESSION_DIRECTORY =
   process.env.UA_SESSION_DIRECTORY ||
   path.join(process.env.XDG_STATE_HOME || path.join(os.homedir(), ".local", "state"), "unreal-agent", "sessions");
+
+const RUNNER_INSTALL_HINT =
+  "install the runner with `go install github.com/unreallabsai/unreal-agent/cmd/unreal-agent-runner@latest` " +
+  "or point UA_RUNNER at the binary";
 
 function log(...parts) {
   process.stderr.write("[unreal-acp] " + parts.join(" ") + "\n");
@@ -74,6 +76,23 @@ function findRunner() {
     }
   }
   return "unreal-agent-runner";
+}
+
+// True when the runner binary can actually be executed (either an absolute
+// path found above or a bare name resolvable through $PATH).
+function runnerAvailable() {
+  const resolved = findRunner();
+  if (path.isAbsolute(resolved)) return true;
+  return (process.env.PATH || "")
+    .split(path.delimiter)
+    .some((dir) => {
+      try {
+        fs.accessSync(path.join(dir, resolved), fs.constants.X_OK);
+        return true;
+      } catch {
+        return false;
+      }
+    });
 }
 
 // ---------- JSON-RPC over ndjson stdio ----------
@@ -135,14 +154,24 @@ class Rpc {
   }
 
   shutdown() {
-    for (const session of sessions.values()) session.cancel();
+    // stdin closed (client went away): stop any live runner processes
+    for (const session of sessions.values()) {
+      if (session.child) {
+        try {
+          session.child.kill("SIGTERM");
+        } catch {
+          // already gone
+        }
+      }
+    }
     process.exit(0);
   }
 }
 
 // ---------- session state ----------
 
-const sessions = new Map(); // sessionId -> {cwd, model, thinking, child, cancelled, pendingPromptId}
+// sessionId -> {id, cwd, model, thinking, proxyPort, proxyToken, child, cancelled}
+const sessions = new Map();
 
 // ---------- ACP mapping helpers ----------
 
@@ -385,7 +414,7 @@ function historyUpdates(sessionId, toolCards) {
   return updates;
 }
 
-async function runPrompt(rpc, session, params, promptId) {
+async function runPrompt(rpc, session, params) {
   const runner = findRunner();
   const request = {
     prompt: params.prompt
@@ -416,9 +445,9 @@ async function runPrompt(rpc, session, params, promptId) {
           ...process.env,
           UNREAL_HARNESS_LLM_PROVIDER: "openai",
           UNREAL_HARNESS_LLM_BASE_URL: "http://127.0.0.1:" + session.proxyPort + "/v1",
-          UNREAL_HARNESS_LLM_API_KEY: "local-proxy",
+          UNREAL_HARNESS_LLM_API_KEY: session.proxyToken,
           UNREAL_HARNESS_LLM_MODEL: session.model,
-          UNREAL_HARNESS_LLM_MAX_ATTEMPTS: "5",
+          UNREAL_HARNESS_LLM_MAX_ATTEMPTS: MAX_ATTEMPTS,
         },
         stdio: ["pipe", "pipe", "pipe"],
       },
@@ -476,7 +505,7 @@ async function runPrompt(rpc, session, params, promptId) {
     });
 
     child.on("error", (err) => {
-      errorMessage = "failed to start runner: " + err.message;
+      errorMessage = "failed to start the unreal-agent-runner (" + err.message + "). " + RUNNER_INSTALL_HINT + ".";
       queue.then(resolve);
     });
     child.on("close", (code) => {
@@ -516,6 +545,30 @@ async function main() {
     apiKey: process.env.UA_API_KEY || "",
   });
 
+  let shuttingDown = false;
+  const shutdownAll = (signal) => {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    log("received " + signal + ", stopping runner processes");
+    for (const session of sessions.values()) {
+      if (session.child) {
+        try {
+          session.child.kill("SIGTERM");
+        } catch {
+          // already gone
+        }
+      }
+    }
+    proxy.close();
+    process.exit(0);
+  };
+  process.on("SIGINT", () => shutdownAll("SIGINT"));
+  process.on("SIGTERM", () => shutdownAll("SIGTERM"));
+
+  if (!runnerAvailable()) {
+    log("warning: unreal-agent-runner not found. " + RUNNER_INSTALL_HINT + ".");
+  }
+
   const rpc = new Rpc();
 
   rpc.on("initialize", () => ({
@@ -537,6 +590,7 @@ async function main() {
       model: DEFAULT_MODEL,
       thinking: DEFAULT_THINKING,
       proxyPort: proxy.port,
+      proxyToken: proxy.token,
       child: null,
       cancelled: false,
     };
@@ -596,11 +650,10 @@ async function main() {
     return { configOptions: configOptionsPayload(session) };
   });
 
-  rpc.on("session/prompt", async (params, id) => {
+  rpc.on("session/prompt", async (params) => {
     const session = sessions.get(params?.sessionId);
     if (!session) throw Object.assign(new Error("unknown session: " + params?.sessionId), { code: -32602 });
-    session.pendingPromptId = id;
-    return runPrompt(rpc, session, params, id);
+    return runPrompt(rpc, session, params);
   });
 
   rpc.on("session/cancel", (params) => {

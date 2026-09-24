@@ -14,10 +14,15 @@
 
 const http = require("node:http");
 const https = require("node:https");
+const crypto = require("node:crypto");
 
 function log(...parts) {
   process.stderr.write("[responses-proxy] " + parts.join(" ") + "\n");
 }
+
+// Kill an upstream call that has been silent for this long instead of hanging
+// the prompt forever (the runner has its own retry policy around non-2xx).
+const UPSTREAM_TIMEOUT_MS = 10 * 60 * 1000;
 
 // ---------- request translation: Responses input -> chat messages ----------
 
@@ -223,7 +228,7 @@ function upstreamClient(url) {
   return url.protocol === "https:" ? https : http;
 }
 
-function upstreamRequest(url, apiKey, chatBody) {
+function upstreamRequest(url, apiKey) {
   const headers = { "Content-Type": "application/json" };
   if (apiKey) headers.Authorization = "Bearer " + apiKey;
   return {
@@ -235,10 +240,11 @@ function upstreamRequest(url, apiKey, chatBody) {
   };
 }
 
-function handleStreamingChat(req, res, url, apiKey, chatBody) {
+function handleStreamingChat(res, url, apiKey, chatBody) {
   const payload = Buffer.from(JSON.stringify(chatBody));
-  const options = upstreamRequest(url, apiKey, chatBody);
+  const options = upstreamRequest(url, apiKey);
   options.headers["Content-Length"] = payload.length;
+  options.timeout = UPSTREAM_TIMEOUT_MS;
   const state = {
     index: Math.floor(Math.random() * 1e9),
     messageText: "",
@@ -293,7 +299,9 @@ function handleStreamingChat(req, res, url, apiKey, chatBody) {
         if (!choice) continue;
         const delta = choice.delta || {};
         if (typeof delta.content === "string") state.messageText += delta.content;
+        // reasoning stream naming differs across gateways
         if (typeof delta.reasoning_content === "string") state.reasoningText += delta.reasoning_content;
+        if (typeof delta.reasoning === "string") state.reasoningText += delta.reasoning;
         for (const call of delta.tool_calls || []) {
           const slot = state.toolCalls[call.index] || (state.toolCalls[call.index] = { arguments: "" });
           if (call.id) slot.id = call.id;
@@ -342,13 +350,14 @@ function handleStreamingChat(req, res, url, apiKey, chatBody) {
 
 // Non-streaming fallback (the runner always sets stream:true; kept for manual
 // testing with curl).
-function handlePlainChat(req, res, url, apiKey, body) {
+function handlePlainChat(res, url, apiKey, body) {
   const chatBody = responsesToChatRequest(body);
   chatBody.stream = false;
   delete chatBody.stream_options;
   const payload = Buffer.from(JSON.stringify(chatBody));
-  const options = upstreamRequest(url, apiKey, chatBody);
+  const options = upstreamRequest(url, apiKey);
   options.headers["Content-Length"] = payload.length;
+  options.timeout = UPSTREAM_TIMEOUT_MS;
   const upstream = upstreamClient(url).request(options, (up) => {
     const chunks = [];
     up.on("data", (chunk) => chunks.push(chunk));
@@ -371,8 +380,17 @@ function startProxy(config) {
   const baseRaw = opts.baseURL || "https://api.openai.com/v1";
   const baseURL = new URL(baseRaw);
   const apiKey = opts.apiKey || "";
+  // Random per-launch bearer token: only callers that got it (the adapter,
+  // passed to the runner via env) may use the proxy, so unrelated local
+  // processes cannot ride the user's API key.
+  const token = opts.token || crypto.randomBytes(16).toString("hex");
 
   const server = http.createServer((req, res) => {
+    if ((req.headers.authorization || "") !== "Bearer " + token) {
+      res.writeHead(401, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: { message: "unauthorized proxy call" } }));
+      return;
+    }
     let body = "";
     req.on("data", (chunk) => (body += chunk));
     req.on("end", () => {
@@ -393,9 +411,9 @@ function startProxy(config) {
         log("warning: no API key configured (UA_API_KEY)");
       }
       if (parsed.stream) {
-        handleStreamingChat(req, res, baseURL, apiKey, responsesToChatRequest(parsed));
+        handleStreamingChat(res, baseURL, apiKey, responsesToChatRequest(parsed));
       } else {
-        handlePlainChat(req, res, baseURL, apiKey, parsed);
+        handlePlainChat(res, baseURL, apiKey, parsed);
       }
     });
   });
@@ -405,7 +423,7 @@ function startProxy(config) {
     server.listen(0, "127.0.0.1", () => {
       const address = server.address();
       log("listening on 127.0.0.1:" + address.port + " -> " + baseRaw);
-      resolve({ port: address.port, close: () => server.close() });
+      resolve({ port: address.port, token, close: () => server.close() });
     });
   });
 }

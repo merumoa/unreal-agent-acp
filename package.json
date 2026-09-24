@@ -1,12 +1,25 @@
 {
   "name": "unreal-agent-acp",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "Agent Client Protocol bridge for the unreal-agent runner, with a local OpenAI Responses API -> chat/completions proxy",
   "license": "MIT",
   "main": "src/adapter.js",
   "bin": {
     "unreal-agent-acp": "src/adapter.js"
   },
+  "files": [
+    "src",
+    "test",
+    "zed-settings.example.json",
+    "README.md",
+    "LICENSE"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/merumoa/unreal-agent-acp.git"
+  },
+  "homepage": "https://github.com/merumoa/unreal-agent-acp#readme",
+  "bugs": "https://github.com/merumoa/unreal-agent-acp/issues",
   "scripts": {
     "smoke": "node test/smoke.js"
   },
@@ -18,6 +31,8 @@
     "agent-client-protocol",
     "zed",
     "unreal-agent",
-    "openai-compatible"
+    "openai-compatible",
+    "chat-completions",
+    "responses-api"
   ]
 }

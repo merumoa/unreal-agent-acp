@@ -5,9 +5,10 @@
 //
 // Env:
 //   UA_API_KEY / UA_BASE_URL - upstream chat/completions gateway (required)
+//   UA_MODEL                 - model to select for the session (recommended;
+//                              defaults to the adapter's first UA_MODELS entry)
 //   UA_TEE                   - optional path to acp-tee.js; when set, the adapter
 //                              is launched through the tee and the log is checked
-//   UA_MODEL                 - model to use (default glm53-flash)
 
 const { spawn } = require("node:child_process");
 const fs = require("node:fs");
@@ -127,6 +128,20 @@ rl.on("line", (line) => {
     } else if (handler === "sessionNew") {
       currentSession = message.result.sessionId;
       process.stderr.write("session: " + currentSession + "\n");
+      if (process.env.UA_MODEL) {
+        request(
+          "session/set_config_option",
+          { sessionId: currentSession, configId: "model", value: process.env.UA_MODEL },
+          "setModel",
+        );
+      } else {
+        request(
+          "session/set_config_option",
+          { sessionId: currentSession, configId: "thinking_level", value: "low" },
+          "setConfig",
+        );
+      }
+    } else if (handler === "setModel") {
       request(
         "session/set_config_option",
         { sessionId: currentSession, configId: "thinking_level", value: "low" },

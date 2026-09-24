@@ -22,17 +22,22 @@ pieces:
   `chat/completions` request, and translates the reply back into the minimal
   Responses SSE event the runner consumes (one terminal
   `response.completed` / `response.incomplete` / `response.failed` event with
-  the full `output` and `usage`).
+  the full `output` and `usage`). It binds to `127.0.0.1` and requires a
+  random per-launch bearer token, so only the runner spawned by the adapter
+  can use it.
 - `src/adapter.js` - the ACP agent. It implements `initialize`, `session/new`,
-  `session/prompt`, `session/cancel` and `session/set_config_option` over
-  newline-delimited JSON-RPC and drives one `unreal-agent-runner` process per
-  prompt, translating the runner's persisted session-item JSONL stream into
-  `session/update` notifications (`agent_message_chunk`, `agent_thought_chunk`,
-  `tool_call`, `tool_call_update`).
+  `session/load`, `session/prompt`, `session/cancel` and
+  `session/set_config_option` over newline-delimited JSON-RPC and drives one
+  `unreal-agent-runner` process per prompt, translating the runner's persisted
+  session-item JSONL stream into `session/update` notifications
+  (`agent_message_chunk`, `agent_thought_chunk`, `tool_call`,
+  `tool_call_update`).
 
 Sessions are durable: the ACP session id is reused as the runner's persisted
 session id, so consecutive prompts in the same session continue the same
-history (`~/.local/state/unreal-agent/sessions`).
+history (`~/.local/state/unreal-agent/sessions` by default). When the client
+reopens a thread, `session/load` replays that persisted conversation (your
+prompts, thinking, answers and tool cards).
 
 ### Display in the client
 
@@ -47,32 +52,36 @@ client-friendly way:
   command output (stdout/stderr/exit code, extracted from the runner's shell
   operation state) attached to the completed `tool_call_update`;
 - per-LLM-turn token usage rides in `_meta.unreal.usage` of the message
-  chunk, task totals in `_meta.unreal.usage` of the prompt result.
+  chunk, task totals (plus `duration_ms`) in `_meta.unreal.usage` of the
+  prompt result.
 
 ## Requirements
 
-- Node.js >= 20 (no npm dependencies)
-- Go 1.27+ to build the upstream runner:
+- Node.js >= 20 (no npm dependencies).
+- The Go-based upstream runner:
   ```sh
   go install github.com/unreallabsai/unreal-agent/cmd/unreal-agent-runner@latest
   ```
-  The adapter looks for the binary in `$UA_RUNNER`, `~/go/bin`, `/opt/homebrew/bin`,
-  `/usr/local/bin`, then `$PATH`.
-- An OpenAI-compatible chat/completions endpoint and API key.
+  The adapter looks for the binary in `$UA_RUNNER`, `~/go/bin`,
+  `/opt/homebrew/bin`, `/usr/local/bin`, then `$PATH`, and logs a warning at
+  startup if it cannot find it.
+- An OpenAI-compatible `chat/completions` endpoint and API key.
 
 ## Configuration (environment)
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
 | `UA_BASE_URL` | `https://api.openai.com/v1` | chat/completions gateway base URL |
-| `UA_API_KEY` | - | API key forwarded as `Authorization: Bearer ...` |
-| `UA_RUNNER` | discovery order above | path to `unreal-agent-runner` |
-| `UA_DEFAULT_MODEL` | `glm53-flash` | model for new sessions |
+| `UA_API_KEY` | - | API key forwarded as `Authorization: Bearer ...` to the gateway |
+| `UA_RUNNER` | discovery order above | path to the `unreal-agent-runner` binary |
+| `UA_MODELS` | `gpt-4o-mini,gpt-4o` | comma-separated models offered in the client's selector |
+| `UA_DEFAULT_MODEL` | first `UA_MODELS` entry | model for new sessions |
 | `UA_DEFAULT_THINKING` | `high` | thinking level for new sessions (`low`..`max`) |
-| `UA_SESSION_DIRECTORY` | `~/.local/state/unreal-agent/sessions` | runner session store |
+| `UA_MAX_ATTEMPTS` | `5` | upstream retry attempts the runner makes per request |
+| `UA_SESSION_DIRECTORY` | `~/.local/state/unreal-agent/sessions` | runner session store used by `session/load` |
 
-The model list offered by `session/new` mirrors common OpenAI-compatible
-gateways; edit `DEFAULT_MODELS` in `src/adapter.js` to match yours.
+Model and thinking level can also be changed per session from the client
+(`session/set_config_option`), which is what Zed's model picker uses.
 
 ## Zed setup
 
@@ -112,17 +121,36 @@ The ndjson log then contains everything worth metering per task:
 - `session/update` `_meta.unreal.usage` - per-LLM-turn token usage
   (`input_tokens`, `cached_input_tokens`, `output_tokens`, `reasoning_tokens`);
 - final `session/prompt` result - `stopReason` plus `_meta.unreal.usage` with
-  task totals and the completion timestamp from the tee.
+  task totals, `duration_ms`, and the completion timestamp from the tee.
 
 ## Smoke test
 
 ```sh
-UA_BASE_URL=https://your-gateway/v1 UA_API_KEY=... npm run smoke
+UA_BASE_URL=https://your-gateway/v1 \
+UA_API_KEY=... \
+UA_MODEL=<a-model-your-gateway-serves> \
+npm run smoke
 ```
 
-The script drives a full session (initialize, session/new, a prompt that
-forces a bash tool call), asserts the update flow and usage metadata, and
-verifies the tee log when `UA_TEE` points to `acp-tee.js`.
+The script drives a full session - initialize, session/new, a prompt that
+forces a bash tool call, then `session/load` and a follow-up prompt to verify
+resume - asserts the update flow and usage metadata, and verifies the tee log
+when `UA_TEE` points to `acp-tee.js`.
+
+## Troubleshooting
+
+- **"failed to start the unreal-agent-runner"** - the binary is missing or
+  not executable. Install it (`go install ...`, see Requirements) or set
+  `UA_RUNNER` to the full path.
+- **401/403 from the gateway** - check `UA_API_KEY` and `UA_BASE_URL`. The
+  key must be valid for the `chat/completions` endpoint exactly as given
+  (include `/v1` for OpenAI-style gateways).
+- **"Model not found" / model errors** - the model in the picker is not
+  served by your gateway. Set `UA_MODELS` to the catalog your gateway
+  actually exposes and pick one.
+- **TLS errors behind a corporate proxy** - point Node at your proxy's CA
+  instead of disabling verification:
+  `export NODE_EXTRA_CA_CERTS=/path/to/corp-ca.pem`.
 
 ## Limitations
 
@@ -132,8 +160,9 @@ verifies the tee log when `UA_TEE` points to `acp-tee.js`.
 - `session/load` replays the persisted conversation from the runner's session
   store (text, tool cards and thinking); attachments and usage from past
   turns are not restored.
-- The chat backend's reasoning stream (e.g. `reasoning_content`) is surfaced
-  as a reasoning summary item, not replayed as provider-native reasoning.
+- The chat backend's reasoning stream (`reasoning_content` / `reasoning`
+  deltas) is surfaced as a reasoning summary item, not replayed as
+  provider-native reasoning.
 - Thinking/answer "streaming" is replay pacing over batch turn output (the
   runner has no partial-message streaming; `include_partial_messages` is
   accepted but ignored upstream).
