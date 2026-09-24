@@ -155,8 +155,8 @@ function mapChatUsage(usage) {
 }
 
 // Some chat templates leak reasoning into the answer text: classic "think"
-// XML tags, or GLM-style models writing a literal "Thinking (...): ..." label
-// the start of the message content. Clean the answer up: think-tag bodies and
+// XML tags, or GLM-style models writing a literal "Thinking (...): ..." label at the
+// start of the message content. Clean the answer up: think-tag bodies and
 // the leading Thinking label move into the reasoning summary, the rest of the
 // text (a plan, notes) stays as the message.
 function extractInlineThinking(state) {
@@ -172,7 +172,7 @@ function extractInlineThinking(state) {
     state.reasoningText += (state.reasoningText ? "\n" : "") + text.slice(open + 7).trim();
     text = text.slice(0, open);
   }
-  text = text.replace(/^\s*\**\s*Thinking\s*\**\s*(\([^)]{0,80}\))?\s*[:：]\s*/i, "");
+  text = text.replace(/^\s*\**\s*Thinking\s*\**\s*(\([^)]{0,80}\))?\s*[:]\s*/i, "");
   state.messageText = text.trim();
 }
 
